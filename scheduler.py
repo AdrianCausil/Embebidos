@@ -1,43 +1,35 @@
 """
 scheduler.py — Planificador cooperativo por tiempo
-Robot7 | Proyecto Final
+Robot11 | MicroPython - Raspberry Pi Pico 2W
 
 Clases:
-  Task       base para todas las tareas del sistema
-  Scheduler  ejecuta tareas según su periodo y prioridad
+    Task       base para todas las tareas del sistema
+    Scheduler  ejecuta tareas según su periodo y prioridad
 
-Uso:
-  class MiTarea(Task):
-      def __init__(self, scheduler):
-          super().__init__(scheduler, period_ms=500, priority=3)
-      def update(self):
-          print("corriendo")
-
-  sched = Scheduler()
-  tarea = MiTarea(sched)
-  sched.run()
-
-Prioridades usadas en el proyecto:
-  1 → SocketClient   (TCP, máxima prioridad)
-  2 → (libre)
-  3 → ModeTask
-  4 → DisplayTask
-  5 → CarTask / ArmTask
-  7 → CameraTask
-  9 → BatteryTask / WatchdogTask
+Prioridades del proyecto:
+    1  → SocketClient   (TCP, máxima prioridad)
+    3  → ModeTask
+    4  → DisplayTask    (OLED)
+    5  → CarTask / ArmTask
+    7  → CameraTask
+    9  → BatteryTask / WatchdogTask
 """
 
 import utime
 import gc
 
 
+# ─────────────────────────────────────────────────────────────
 class Task:
     """
     Tarea base. Subclasificar y sobreescribir update().
 
-    period_ms : cada cuánto ms se llama update()
-    priority  : menor número = se ejecuta primero en cada ciclo
+    Parámetros:
+        scheduler  : instancia de Scheduler donde se registra
+        period_ms  : cada cuántos ms se llama update()
+        priority   : menor número = se ejecuta primero
     """
+
     def __init__(self, scheduler, period_ms, priority=5):
         self.period   = period_ms
         self.priority = priority
@@ -45,41 +37,59 @@ class Task:
         scheduler.add(self)
 
     def update(self):
+        """Sobreescribir en subclase. No debe bloquear más de ~5 ms."""
         pass
 
 
+# ─────────────────────────────────────────────────────────────
 class Scheduler:
     """
-    Planificador cooperativo (single-thread).
+    Planificador cooperativo (single-thread, sin RTOS).
 
-    REGLA IMPORTANTE:
-    Las tareas no deben bloquear más de unos pocos ms,
-    salvo CarTask y ArmTask que bloquean durante el movimiento
-    — eso es intencional para no enviar comandos a medias.
+    Regla: ningún update() debe bloquear el hilo salvo que sea
+    intencional (ej. movimiento de motores paso a paso).
     """
+
     def __init__(self):
-        self.tasks    = []
-        self._running = True
-
-    def add(self, task):
-        self.tasks.append(task)
-        self.tasks.sort(key=lambda t: t.priority)
-
-    def stop(self):
+        self._tasks   = []
         self._running = False
 
+    # ── Gestión de tareas ─────────────────────────────────────
+
+    def add(self, task):
+        """Agrega una tarea y reordena por prioridad."""
+        self._tasks.append(task)
+        self._tasks.sort(key=lambda t: t.priority)
+
+    def remove(self, task):
+        """Elimina una tarea del loop."""
+        if task in self._tasks:
+            self._tasks.remove(task)
+
+    def stop(self):
+        """Detiene el loop en la próxima iteración."""
+        self._running = False
+
+    # ── Loop principal ────────────────────────────────────────
+
     def run(self):
+        """Inicia el loop cooperativo. Bloquea hasta stop()."""
+        self._running = True
         print("[SCHED] Iniciando loop...")
+
         while self._running:
             now = utime.ticks_ms()
-            for task in self.tasks:
+
+            for task in self._tasks:
                 if utime.ticks_diff(now, task.next_run) >= 0:
                     try:
                         task.update()
                     except Exception as e:
                         print(f"[SCHED] Error en {task.__class__.__name__}: {e}")
-                    task.next_run = utime.ticks_add(
-                        utime.ticks_ms(), task.period
-                    )
+                    # Reprogramar desde el momento real de ejecución
+                    task.next_run = utime.ticks_add(utime.ticks_ms(), task.period)
+
             gc.collect()
             utime.sleep_ms(1)
+
+        print("[SCHED] Loop detenido.")

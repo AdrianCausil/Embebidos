@@ -1,48 +1,48 @@
 """
 pubsub.py — Cliente PubSub sobre TCP
-Robot7
+Robot11 | MicroPython - Raspberry Pi Pico 2W
 
 Clases:
-  SocketClient   conexión TCP no-bloqueante al broker
-  Node           nodo PubSub local + puente al broker
+    SocketClient   conexión TCP no-bloqueante al broker (es una Task)
+    Node           nodo PubSub local con puente al broker
 
-Topics tienen prefijo: UDFJC/emb1/robot11/
+Prefijo de tópicos: UDFJC/emb1/robot11/
+Los módulos trabajan con tópicos cortos (sin prefijo).
+El prefijo se agrega automáticamente al hablar con el broker.
 
 Uso mínimo:
-  from pubsub import SocketClient, Node
-  from scheduler import Scheduler
+    from scheduler import Scheduler
+    from pubsub    import SocketClient, Node
 
-  sched  = Scheduler()
-  sock   = SocketClient("192.168.1.x", 5051, sched)
-  pubsub = Node(sock)
+    sched  = Scheduler()
+    sock   = SocketClient("192.168.x.x", 5051, sched)
+    pubsub = Node(sock)
 
-  pubsub.subscribe("car/cmd", lambda d: print(d))
-  pubsub.publish("debug/log", {"msg": "hola"})
+    pubsub.subscribe("test/pong", lambda d: print("pong:", d))
+    pubsub.publish("test/ping", {"msg": "hola"})
 
-  sock.connect()
-  sched.run()
+    sched.run()
 """
 
 import usocket as socket
-import ujson as json
+import ujson   as json
 import utime
-import gc
 
 
-ROBOT_ID  = "robot11"
-TOPIC_PRE = "UDFJC/emb1/" + ROBOT_ID + "/"
+ROBOT_ID   = "robot11"
+TOPIC_PRE  = "UDFJC/emb1/" + ROBOT_ID + "/"
 
 
+# ─────────────────────────────────────────────────────────────
 class SocketClient:
     """
-    Conexión TCP no-bloqueante al broker.
-    Se integra con el Scheduler como Task (prioridad 1).
+    Conexión TCP no-bloqueante al broker del PC.
+    Se registra en el Scheduler como Task con prioridad 1.
 
-    Protocolo: JSON por línea (newline-delimited JSON).
-    Cada mensaje termina en \\n.
+    Protocolo: JSON por línea (newline-delimited JSON, \\n).
     """
 
-    def __init__(self, host, port, scheduler=None,
+    def __init__(self, host, port, scheduler,
                  period_ms=50, priority=1):
         self.host      = host
         self.port      = port
@@ -53,16 +53,14 @@ class SocketClient:
         self.sock      = None
         self.connected = False
         self._rx       = b""
-        self._actions  = {}
+        self._actions  = {}          # "PUB" → callback
 
-        if scheduler:
-            scheduler.add(self)
+        scheduler.add(self)
 
-    # ══════════════════════════════════════════════════════════
-    #  Conexión
-    # ══════════════════════════════════════════════════════════
+    # ── Conexión ──────────────────────────────────────────────
 
     def connect(self):
+        """Intenta conectar al broker. Retorna True si éxito."""
         try:
             addr = socket.getaddrinfo(self.host, self.port)[0][-1]
             s    = socket.socket()
@@ -73,13 +71,13 @@ class SocketClient:
             print(f"[TCP] Conectado a {self.host}:{self.port}")
             return True
         except Exception as e:
-            print(f"[TCP] Error: {e}")
+            print(f"[TCP] Fallo conexión: {e}")
             self.sock      = None
             self.connected = False
             return False
 
     def ensure(self):
-        """Reconecta si perdió la conexión."""
+        """Reconecta si la conexión se perdió."""
         if not self.connected or self.sock is None:
             self.connect()
 
@@ -91,34 +89,41 @@ class SocketClient:
             pass
         self.sock      = None
         self.connected = False
+        print("[TCP] Desconectado.")
 
-    # ══════════════════════════════════════════════════════════
-    #  Envío
-    # ══════════════════════════════════════════════════════════
+    # ── Envío con reintentos (optimizado para EAGAIN) ─────────────────
 
     def send_json(self, obj):
+        """Serializa obj a JSON y lo envía con \\n al final.
+        Reintenta hasta 5 veces si el buffer de salida está lleno (EAGAIN)."""
         if not self.connected:
             return False
-        try:
-            raw = (json.dumps(obj) + "\n").encode()
-            self.sock.send(raw)
-            return True
-        except Exception as e:
-            print(f"[TCP] send err: {e}")
-            self.connected = False
-            self.sock      = None
-            return False
+        raw = (json.dumps(obj) + "\n").encode()
+        for attempt in range(5):
+            try:
+                self.sock.send(raw)
+                return True
+            except OSError as e:
+                if e.errno == 11:  # EAGAIN (buffer lleno)
+                    utime.sleep_ms(5)   # esperar un poco y reintentar
+                    continue
+                else:
+                    raise
+            except Exception as e:
+                print(f"[TCP] send error: {e}")
+                break
+        # Si llegamos aquí, falló después de reintentos
+        self.connected = False
+        self.sock = None
+        return False
 
-    # ══════════════════════════════════════════════════════════
-    #  Registro de acciones (despacho de mensajes entrantes)
-    # ══════════════════════════════════════════════════════════
+    # ── Registro de acciones ──────────────────────────────────
 
     def add_action(self, action, callback):
+        """Registra un callback para un tipo de acción entrante."""
         self._actions[action] = callback
 
-    # ══════════════════════════════════════════════════════════
-    #  update() — llamado por el Scheduler cada period_ms
-    # ══════════════════════════════════════════════════════════
+    # ── update() — llamado por el Scheduler ───────────────────
 
     def update(self):
         # Reconectar si es necesario
@@ -130,15 +135,15 @@ class SocketClient:
         try:
             data = self.sock.recv(512)
             if data == b"":
-                print("[TCP] Broker cerró la conexión")
+                print("[TCP] Broker cerró la conexión.")
                 self.connected = False
                 return
             if data:
                 self._rx += data
         except OSError:
-            pass   # sin datos — normal en non-blocking
+            pass   # sin datos disponibles, es normal en non-blocking
 
-        # Procesar líneas completas
+        # Procesar todas las líneas completas
         while b"\n" in self._rx:
             line, self._rx = self._rx.split(b"\n", 1)
             if not line:
@@ -146,22 +151,21 @@ class SocketClient:
             try:
                 msg    = json.loads(line)
                 action = msg.get("action")
-                if action in self._actions:
-                    self._actions[action](msg)
+                cb     = self._actions.get(action)
+                if cb:
+                    cb(msg)
             except Exception as e:
-                print(f"[TCP] JSON err: {e}")
+                print(f"[TCP] JSON parse error: {e}")
 
 
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 class Node:
     """
-    Nodo PubSub.
+    Nodo PubSub local con puente al broker.
 
-    publish(topic, data)      → entrega local + envía al broker
-    subscribe(topic, callback) → registra local + notifica al broker
-
-    Los topics son locales (sin prefijo).
-    El prefijo UDFJC/emb1/robot11/ se añade solo al hablar con el broker.
+    publish(topic, data)       → entrega local + envía al broker
+    publish_local(topic, data) → solo entrega local (sin broker)
+    subscribe(topic, callback) → registra local + avisa al broker
     """
 
     def __init__(self, sock_client, prefix=TOPIC_PRE):
@@ -170,31 +174,35 @@ class Node:
         self._subs  = {}   # topic_local → [callback, ...]
         sock_client.add_action("PUB", self._on_broker_pub)
 
-    # ── API pública ────────────────────────────────────────────
+    # ── API pública ───────────────────────────────────────────
 
     def publish(self, topic, data):
-        """Publica en el bus local y en el broker."""
-        self._local(topic, data)
-        self._broker_pub(topic, data)
+        """Publica en el bus local y envía al broker."""
+        self._deliver_local(topic, data)
+        self._send_to_broker(topic, data)
 
     def publish_local(self, topic, data):
         """Publica solo en el bus local, sin enviar al broker."""
-        self._local(topic, data)
+        self._deliver_local(topic, data)
 
     def subscribe(self, topic, callback):
-        """Suscribe callback y registra en el broker."""
+        """Suscribe callback al tópico y lo registra en el broker."""
         self._subs.setdefault(topic, []).append(callback)
         self.sock.ensure()
         self.sock.send_json({
             "action": "SUB",
             "topic":  self.prefix + topic
         })
-        print(f"[SUB] {callback.__self__.__class__.__name__}"
-              f".{callback.__name__} → {topic}")
+        # Nombre legible del callback
+        try:
+            name = f"{callback.__self__.__class__.__name__}.{callback.__name__}"
+        except AttributeError:
+            name = str(callback)
+        print(f"[NODE] Suscrito: {name} → {topic}")
 
-    # ── Internos ───────────────────────────────────────────────
+    # ── Internos ──────────────────────────────────────────────
 
-    def _broker_pub(self, topic, data):
+    def _send_to_broker(self, topic, data):
         self.sock.ensure()
         self.sock.send_json({
             "action": "PUB",
@@ -202,16 +210,16 @@ class Node:
             "data":   data
         })
 
-    def _local(self, topic, data):
+    def _deliver_local(self, topic, data):
         for cb in list(self._subs.get(topic, [])):
             try:
                 cb(data)
             except Exception as e:
-                print(f"[PubSub] Error '{topic}': {e}")
+                print(f"[NODE] Error en callback '{topic}': {e}")
 
     def _on_broker_pub(self, msg):
         """Recibe PUB del broker y lo entrega en el bus local."""
         t = msg.get("topic", "")
         if t.startswith(self.prefix):
-            local = t[len(self.prefix):]
-            self._local(local, msg.get("data", {}))
+            local_topic = t[len(self.prefix):]
+            self._deliver_local(local_topic, msg.get("data", {}))

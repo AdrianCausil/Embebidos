@@ -1,5 +1,6 @@
 """
-camera.py -- Cámara OV7670 ultrarrápida (80x60, centroides RGB, sensible)
+camera_vision.py -- Cámara OV7670 ultrarrápida (80x60, centroides RGB)
+Publica los centroides en el tópico "camera/centroids"
 """
 
 import utime, gc, _thread
@@ -14,6 +15,7 @@ try:
 except ImportError:
     print("[CAM] ov7670_wrapper no encontrado")
 
+# Pines (ajusta a tu conexión física)
 CAM_D0       = 0
 CAM_PCLK     = 8
 CAM_MCLK     = 9
@@ -28,12 +30,12 @@ CAM_W = 80
 CAM_H = 60
 CAM_BUF_SIZE = CAM_W * CAM_H * 2
 
+# Umbrales RGB (ajústalos según tus tubos)
 _TH = {
     "red":   {"r_min": 130, "g_max": 110, "b_max": 110},
     "green": {"g_min": 90,  "r_max": 130, "b_max": 120},
-    "blue":  {"b_min": 80, "r_max": 100, "g_max": 100},   # más estricto
+    "blue":  {"b_min": 90,  "r_max": 130, "g_max": 120},
 }
-
 
 COLOR_NONE = 0
 COLOR_RED = 1
@@ -49,6 +51,7 @@ class CameraTask:
         self._cam_ok = False
         self._buf = bytearray(CAM_BUF_SIZE)
 
+        # Centroides (lectura directa)
         self.red_cx = -1
         self.green_cx = -1
         self.blue_cx = -1
@@ -63,7 +66,7 @@ class CameraTask:
 
         if scheduler:
             scheduler.add(self)
-        print("[CAM] Cámara ultrarrápida y sensible (80x60)")
+        print("[CAM] Cámara lista (publica centroides en 'camera/centroids')")
 
     def _init_camera(self):
         try:
@@ -94,6 +97,13 @@ class CameraTask:
             try:
                 self._cam.capture(self._buf)
                 self._calcular_centroides(self._buf)
+                # Publicar inmediatamente (cada frame)
+                if self.pubsub:
+                    self.pubsub.publish("camera/centroids", {
+                        "red": self.red_cx,
+                        "green": self.green_cx,
+                        "blue": self.blue_cx
+                    })
             except Exception as e:
                 print("[CAM] capture err:", e)
                 utime.sleep_ms(50)
@@ -115,9 +125,8 @@ class CameraTask:
         return COLOR_NONE
 
     def _calcular_centroides(self, buf):
-        # Analiza TODA la imagen (sin recortar) para máxima sensibilidad
         sr = br = sg = bg = sb = bb = 0
-        step = 2   # muestreo fino
+        step = 2
         for y in range(0, CAM_H, step):
             row = y * CAM_W
             for x in range(0, CAM_W, step):
@@ -136,7 +145,7 @@ class CameraTask:
                 elif c == COLOR_BLUE:
                     sb += x
                     bb += 1
-        MIN_PX = 5   # muy sensible (detecta aunque sea pequeña mancha)
+        MIN_PX = 5
         self.red_cx = sr // br if br >= MIN_PX else -1
         self.green_cx = sg // bg if bg >= MIN_PX else -1
         self.blue_cx = sb // bb if bb >= MIN_PX else -1

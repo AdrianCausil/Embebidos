@@ -1,366 +1,221 @@
-# main.py — Batería + Sonar HC-SR04 + servidor web
-# Pico 2W  +  OLED 1.3" SH1106 I2C (128x64)
-# Red: iPhone | IP Pico: 172.20.10.13
+"""
+main.py -- Modo "Derecho": detecta colores, recoge, gira 90°, pausa, retrocede 10cm, suelta, retrocede, sube brazo a home.
+"""
 
-import network, socket, time, machine, json
-from machine import Pin, time_pulse_us
-from sh1106 import SH1106
+import network
+import utime
+from scheduler import Scheduler, Task
+from pubsub import SocketClient, Node
+from car import CarTask
+from arm import ArmTask
+from camera import CameraTask
 
-# ──────────────────────────────────────────────
-WIFI_SSID = "iPhone"
-WIFI_PASS = "aecv1234"
+# ========== CONFIGURACIÓN ==========
+WIFI_SSID = "A35deFabian"
+WIFI_PASS = "FAGTAAAA"
+BROKER_IP = "10.182.144.3"
+BROKER_PORT = 5051
 
-# ──────────────────────────────────────────────
-#  Hardware
-# ──────────────────────────────────────────────
-i2c  = machine.I2C(1, scl=machine.Pin(3), sda=machine.Pin(2), freq=400000)
-oled = SH1106(i2c, addr=0x3C)
-adc  = machine.ADC(machine.Pin(26))
+# Parámetros de la rutina de recogida
+BACKUP_MS = 0
+BACKUP_SPEED = 40
+FORWARD_TIME_MS = 1400
+FORWARD_SPEED = 50
 
-# Sonar — GP4=TRIG, GP5=ECHO
-TRIG = Pin(4, Pin.OUT)
-ECHO = Pin(5, Pin.IN)
-TRIG.low()
+# Parámetros de la entrega (después de levantar) - retroceso inicial
+TURN_90_MS = 1700
+TURN_SPEED = 50
+DELIVER_PAUSE_MS = 1000          # pausa después del giro
+DELIVER_BACKWARD_CM = 15         # cm a retroceder después del giro
+DELIVER_BACKWARD_SPEED = 40
+CM_PER_SEC = 15.0
 
-# Divisor de voltaje: 3 resistencias de 100k
-# R1+R2=200k arriba, R3=100k abajo → factor=3.0
-FACTOR       = 3.0
-V_MAX, V_MIN = 8.40, 6.00
+# Parámetros de retroceso después de soltar (AHORA ACTIVADO)
+DELIVER_BACKUP_MS = 100         # tiempo que retrocede después de soltar (ms)
+DELIVER_BACKUP_SPEED = 0
+# Se elimina la pausa después de soltar (opcional)
+DELIVER_PAUSE_AFTER_DROP_MS = 0   # sin pausa extra
 
-# ──────────────────────────────────────────────
-#  Estado global
-# ──────────────────────────────────────────────
-intervalo  = 2
-ultimo_v   = 0.0
-ultimo_pct = 0.0
-ultimo_cm  = -1
+# Tiempos del brazo (segundos)
+ARM_DOWN_WAIT_SEC = 1.5
+ARM_UP_WAIT_SEC = 1.5
 
-# ──────────────────────────────────────────────
-#  Medición batería
-# ──────────────────────────────────────────────
-def leer_voltaje(muestras=20):
-    total = sum(adc.read_u16() for _ in range(muestras))
-    v_adc = (total / muestras) * 3.3 / 65535
-    return round(v_adc * FACTOR, 2)
+# Umbrales de centroides
+TH_RED = -10
+TH_GREEN = 20
+TH_BLUE = -8
+MIN_CONSECUTIVE = 2
 
-def calcular_pct(v):
-    return max(0.0, min(100.0, ((v - V_MIN) / (V_MAX - V_MIN)) * 100))
+# ========== TAREA DE AUTONOMÍA ==========
+class AutonomyTask(Task):
+    def __init__(self, scheduler, pubsub, car_task, arm_task, camera_task,
+                 period_ms=100, priority=6):
+        super().__init__(scheduler, period_ms=period_ms, priority=priority)
+        self.pubsub = pubsub
+        self.car = car_task
+        self.arm = arm_task
+        self.camera = camera_task
 
-# ──────────────────────────────────────────────
-#  Medición sonar
-# ──────────────────────────────────────────────
-def leer_sonar():
-    TRIG.low()
-    time.sleep_us(2)
-    TRIG.high()
-    time.sleep_us(10)
-    TRIG.low()
-    duracion = time_pulse_us(ECHO, 1, 25000)
-    if duracion < 0:
-        return -1
-    cm = round((duracion * 0.0343) / 2.0, 1)
-    if cm < 2 or cm > 400:
-        return -1
-    return cm
+        self.state = "IDLE"
+        self.timer_start = 0
+        self.detection_counter = 0
+        self.sequence_started = False
+        self.deliver_backward_time_ms = int((DELIVER_BACKWARD_CM / CM_PER_SEC) * 1000) if CM_PER_SEC > 0 else 0
 
-# ──────────────────────────────────────────────
-#  OLED
-# ──────────────────────────────────────────────
-def oled_msg(l1, l2=""):
-    oled.fill(0)
-    oled.text(l1[:16], 0, 10, 1)
-    if l2:
-        oled.text(l2[:16], 0, 30, 1)
-    oled.show()
+        self._print_timer = utime.ticks_ms()
+        print("[AUTO] Modo DERECHO con retroceso después de soltar ({} ms). Esperando colores...".format(DELIVER_BACKUP_MS))
 
-def dibujar(v, pct, cm):
-    oled.fill(0)
-    oled.text("ROBOT11", 0, 0, 1)
-    oled.hline(0, 10, 128, 1)
-    oled.text("{:.2f}V {:3.0f}%".format(v, pct), 0, 14, 1)
-    # Barra batería
-    BW = 100
-    oled.rect(0, 26, BW, 10, 1)
-    fw = int((BW - 2) * pct / 100)
-    if fw > 0:
-        oled.fill_rect(1, 27, fw, 8, 1)
-    oled.hline(0, 40, 128, 1)
-    if cm > 0:
-        oled.text("Dist:{:.1f}cm".format(cm), 0, 44, 1)
-    else:
-        oled.text("Dist: -- cm", 0, 44, 1)
-    oled.show()
+    def update(self):
+        now = utime.ticks_ms()
 
-# ──────────────────────────────────────────────
-#  WiFi
-# ──────────────────────────────────────────────
-def conectar_wifi():
-    oled_msg("Conectando...", WIFI_SSID)
-    w = network.WLAN(network.STA_IF)
-    w.active(True)
-    w.connect(WIFI_SSID, WIFI_PASS)
-    for i in range(30):
-        if w.isconnected():
-            ip = w.ifconfig()[0]
-            oled_msg("WiFi OK", ip)
-            print("IP:", ip)
-            time.sleep(2)
-            return ip
-        time.sleep(0.5)
-    oled_msg("WiFi FALLO")
-    print("WiFi no conectó")
-    return "sin-wifi"
+        if utime.ticks_diff(now, self._print_timer) >= 1000:
+            self._print_timer = now
+            print(f"[CAM] R:{self.camera.red_cx:3d} G:{self.camera.green_cx:3d} B:{self.camera.blue_cx:3d}")
 
-# ──────────────────────────────────────────────
-#  HTML
-# ──────────────────────────────────────────────
-HTML = b"""<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="0">
-  <title>Robot11 Sensores</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;
-         display:flex;flex-direction:column;align-items:center;
-         justify-content:center;min-height:100vh;padding:20px}
-    .card{background:#16213e;border-radius:16px;padding:30px;
-          width:100%;max-width:400px;box-shadow:0 4px 20px #0005}
-    h1{text-align:center;margin-bottom:24px;font-size:1.3rem;color:#a0c4ff}
-    .sec{margin-bottom:20px}
-    .sec-title{color:#a0c4ff;font-size:.8rem;letter-spacing:2px;
-               text-transform:uppercase;margin-bottom:10px;
-               border-bottom:1px solid #333;padding-bottom:4px}
-    .dato{display:flex;justify-content:space-between;
-          align-items:center;margin-bottom:8px}
-    .label{color:#aaa;font-size:.9rem}
-    .valor{font-size:1.8rem;font-weight:bold;color:#fff}
-    .barra-bg{background:#333;border-radius:8px;
-              height:24px;overflow:hidden;margin:8px 0}
-    .barra-fill{height:100%;border-radius:8px;
-                transition:width .6s,background .6s;width:0%}
-    .estado{text-align:center;font-size:1rem;
-            font-weight:bold;margin-top:4px}
-    .sonar-val{font-size:2.8rem;font-weight:bold;
-               text-align:center;color:#00e676;margin:8px 0}
-    .sonar-bg{background:#333;border-radius:8px;
-              height:14px;overflow:hidden;margin:6px 0}
-    .sonar-fill{height:100%;border-radius:8px;
-                background:#00e676;transition:width .4s;width:0%}
-    hr{border:none;border-top:1px solid #333;margin:16px 0}
-    .form-row{display:flex;gap:10px;align-items:center;
-              flex-wrap:wrap;justify-content:center}
-    .form-row label{color:#aaa;font-size:.9rem}
-    input[type=number]{background:#0f3460;color:#fff;
-                       border:1px solid #444;border-radius:8px;
-                       padding:8px;width:70px;font-size:1rem}
-    button{background:#4361ee;color:#fff;border:none;
-           border-radius:8px;padding:9px 18px;
-           cursor:pointer;font-size:1rem}
-    button:hover{background:#3a0ca3}
-    .pie{text-align:center;font-size:.75rem;color:#555;margin-top:14px}
-    .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
-         background:#4caf50;margin-right:6px;vertical-align:middle;
-         animation:pulso 1.5s infinite}
-    @keyframes pulso{0%,100%{opacity:1}50%{opacity:.3}}
-    .dot.err{background:#f44336;animation:none}
-  </style>
-</head>
-<body>
-<div class="card">
-  <h1>&#9889; Robot11 &mdash; Sensores</h1>
+        if self.state == "DONE":
+            return
 
-  <div class="sec">
-    <div class="sec-title">Bateria 2S Li-Ion</div>
-    <div class="dato">
-      <span class="label">Voltaje</span>
-      <span class="valor" id="v">--</span>
-    </div>
-    <div class="dato">
-      <span class="label">Nivel</span>
-      <span class="valor" id="pct">--</span>
-    </div>
-    <div class="barra-bg">
-      <div class="barra-fill" id="barra"></div>
-    </div>
-    <div class="estado" id="bat-estado">Cargando...</div>
-  </div>
+        # Detección de colores en IDLE
+        if self.state == "IDLE":
+            r = self.camera.red_cx
+            g = self.camera.green_cx
+            b = self.camera.blue_cx
+            if r > TH_RED and g > TH_GREEN and b > TH_BLUE:
+                self.detection_counter += 1
+                if self.detection_counter >= MIN_CONSECUTIVE and not self.sequence_started:
+                    print(f"[AUTO] ¡Colores detectados! (R={r} G={g} B={b})")
+                    self.sequence_started = True
+                    self._start_sequence()
+            else:
+                self.detection_counter = 0
 
-  <hr>
+        # Estados de recogida
+        if self.state == "BACKUP":
+            if utime.ticks_diff(now, self.timer_start) >= BACKUP_MS:
+                self.pubsub.publish("car/cmd", {"dir": "stop"})
+                self.state = "ARM_DOWN"
+                self.timer_start = now
+                self.pubsub.publish("arm/cmd", {"action": "abajo"})
+                print("[AUTO] Bajando brazo...")
 
-  <div class="sec">
-    <div class="sec-title">Sonar HC-SR04</div>
-    <div class="sonar-val" id="cm">-- cm</div>
-    <div class="sonar-bg">
-      <div class="sonar-fill" id="sonar-barra"></div>
-    </div>
-    <div class="estado" id="sonar-estado" style="color:#00e676">--</div>
-  </div>
+        elif self.state == "ARM_DOWN":
+            if utime.ticks_diff(now, self.timer_start) >= ARM_DOWN_WAIT_SEC * 1000:
+                self.state = "FORWARD"
+                self.timer_start = now
+                if FORWARD_TIME_MS > 0:
+                    print(f"[AUTO] Avanzando {FORWARD_TIME_MS} ms")
+                    self.pubsub.publish("car/cmd", {"dir": "fwd", "speed": FORWARD_SPEED})
+                else:
+                    self.state = "ARM_UP"
+                    self.timer_start = now
+                    self.pubsub.publish("arm/cmd", {"action": "home"})
 
-  <hr>
+        elif self.state == "FORWARD":
+            if utime.ticks_diff(now, self.timer_start) >= FORWARD_TIME_MS:
+                self.pubsub.publish("car/cmd", {"dir": "stop"})
+                print("[AUTO] Avance completado. Subiendo brazo...")
+                self.state = "ARM_UP"
+                self.timer_start = now
+                self.pubsub.publish("arm/cmd", {"action": "home"})
 
-  <div class="form-row">
-    <label>Actualizar cada</label>
-    <input type="number" id="seg" value="2" min="1" max="60">
-    <label>seg</label>
-    <button onclick="setInt()">Aplicar</button>
-  </div>
+        elif self.state == "ARM_UP":
+            if utime.ticks_diff(now, self.timer_start) >= ARM_UP_WAIT_SEC * 1000:
+                print("[AUTO] Brazo arriba. Iniciando entrega (giro)...")
+                self.state = "DELIVER_TURN"
+                self.timer_start = now
+                self.pubsub.publish("car/cmd", {"dir": "right", "speed": TURN_SPEED})
+                print(f"[AUTO] Girando derecha {TURN_90_MS} ms")
 
-  <p class="pie">
-    <span class="dot" id="dot"></span>
-    <span id="pie">Conectando...</span>
-  </p>
-</div>
+        # Estados de entrega: retrocede después de girar, suelta, luego retrocede más
+        elif self.state == "DELIVER_TURN":
+            if utime.ticks_diff(now, self.timer_start) >= TURN_90_MS:
+                self.pubsub.publish("car/cmd", {"dir": "stop"})
+                print("[AUTO] Giro completado. Pausando antes de retroceder...")
+                self.state = "DELIVER_PAUSE"
+                self.timer_start = now
 
-<script>
-var seg=2, timer=null;
+        elif self.state == "DELIVER_PAUSE":
+            if utime.ticks_diff(now, self.timer_start) >= DELIVER_PAUSE_MS:
+                self.state = "DELIVER_BACKWARD"
+                self.timer_start = now
+                if self.deliver_backward_time_ms > 0:
+                    print(f"[AUTO] Retrocediendo {DELIVER_BACKWARD_CM} cm ({self.deliver_backward_time_ms} ms)")
+                    self.pubsub.publish("car/cmd", {"dir": "bwd", "speed": DELIVER_BACKWARD_SPEED})
+                else:
+                    self.state = "DELIVER_DOWN"
+                    self.timer_start = now
+                    self.pubsub.publish("arm/cmd", {"action": "abajo"})
 
-function cBat(p){return p>=60?'#4caf50':p>=30?'#ff9800':'#f44336';}
-function eBat(p){return p>=75?'Llena \u2714':p>=50?'Buena':p>=25?'Media':'Baja! \u26a0';}
-function eSon(c){
-  if(c<0) return 'Sin deteccion';
-  if(c<10) return '\u26a0 Muy cerca!';
-  if(c<30) return 'Cerca';
-  if(c<80) return 'Medio';
-  return 'Lejos';
-}
+        elif self.state == "DELIVER_BACKWARD":
+            if utime.ticks_diff(now, self.timer_start) >= self.deliver_backward_time_ms:
+                self.pubsub.publish("car/cmd", {"dir": "stop"})
+                print("[AUTO] Retroceso completado. Bajando brazo para soltar...")
+                self.state = "DELIVER_DOWN"
+                self.timer_start = now
+                self.pubsub.publish("arm/cmd", {"action": "abajo"})
 
-function actualizar(){
-  fetch('/datos?t='+Date.now())
-    .then(function(r){return r.json();})
-    .then(function(d){
-      document.getElementById('v').textContent=d.v.toFixed(2)+' V';
-      document.getElementById('pct').textContent=d.pct.toFixed(0)+'%';
-      var c=cBat(d.pct);
-      var b=document.getElementById('barra');
-      b.style.width=Math.max(0,Math.min(100,d.pct)).toFixed(0)+'%';
-      b.style.background=c;
-      var be=document.getElementById('bat-estado');
-      be.textContent=eBat(d.pct); be.style.color=c;
+        elif self.state == "DELIVER_DOWN":
+            if utime.ticks_diff(now, self.timer_start) >= ARM_DOWN_WAIT_SEC * 1000:
+                print("[AUTO] Estiba soltada. Retrocediendo para separarse...")
+                self.state = "DELIVER_BACKUP"
+                self.timer_start = now
+                self.pubsub.publish("car/cmd", {"dir": "bwd", "speed": DELIVER_BACKUP_SPEED})
+                print(f"[AUTO] Retrocediendo {DELIVER_BACKUP_MS} ms")
 
-      var cm=d.cm;
-      document.getElementById('cm').textContent=cm>0?cm.toFixed(1)+' cm':'-- cm';
-      var pSon=cm>0?Math.max(0,Math.min(100,(1-cm/200)*100)):0;
-      document.getElementById('sonar-barra').style.width=pSon.toFixed(0)+'%';
-      var se=document.getElementById('sonar-estado');
-      se.textContent=eSon(cm);
+        elif self.state == "DELIVER_BACKUP":
+            if utime.ticks_diff(now, self.timer_start) >= DELIVER_BACKUP_MS:
+                self.pubsub.publish("car/cmd", {"dir": "stop"})
+                print("[AUTO] Retroceso completado. Subiendo brazo a home...")
+                self.state = "FINAL_ARM_UP"
+                self.timer_start = now
+                self.pubsub.publish("arm/cmd", {"action": "home"})
 
-      document.getElementById('dot').className='dot';
-      document.getElementById('pie').textContent='Robot11 activo \u2022 172.20.10.13';
-    })
-    .catch(function(){
-      document.getElementById('dot').className='dot err';
-      document.getElementById('pie').textContent='Sin respuesta del Pico...';
-    });
-}
+        elif self.state == "FINAL_ARM_UP":
+            if utime.ticks_diff(now, self.timer_start) >= ARM_UP_WAIT_SEC * 1000:
+                print("[AUTO] Secuencia completada (brazo en home). Fin.")
+                self.state = "DONE"
 
-function setInt(){
-  var n=parseInt(document.getElementById('seg').value);
-  if(isNaN(n)||n<1||n>60){alert('Valor entre 1 y 60');return;}
-  seg=n;
-  fetch('/intervalo?seg='+n).catch(function(){});
-  reiniciar();
-}
-
-function reiniciar(){
-  if(timer) clearInterval(timer);
-  actualizar();
-  timer=setInterval(actualizar,seg*1000);
-}
-
-reiniciar();
-</script>
-</body>
-</html>"""
-
-# ──────────────────────────────────────────────
-#  Servidor web
-# ──────────────────────────────────────────────
-def send_response(conn, code, ctype, body):
-    if isinstance(body, str):
-        body = body.encode()
-    header = (
-        "HTTP/1.1 {} OK\r\n"
-        "Content-Type: {}\r\n"
-        "Content-Length: {}\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n"
-    ).format(code, ctype, len(body))
-    conn.sendall(header.encode() + body)
-
-def manejar(conn):
-    global intervalo
-    try:
-        conn.settimeout(3.0)
-        req = b""
-        while True:
-            chunk = conn.recv(256)
-            if not chunk:
-                break
-            req += chunk
-            if b"\r\n\r\n" in req or len(chunk) < 256:
-                break
-        linea = req.decode("utf-8", "ignore").split("\r\n")[0]
-
-        if "/intervalo" in linea:
-            try:
-                nuevo = int(linea.split("seg=")[1].split(" ")[0].split("&")[0])
-                if 1 <= nuevo <= 60:
-                    intervalo = nuevo
-            except:
-                pass
-            send_response(conn, 200, "text/plain", "ok")
-
-        elif "/datos" in linea:
-            data = json.dumps({
-                "v":   round(ultimo_v,   2),
-                "pct": round(ultimo_pct, 1),
-                "cm":  ultimo_cm
-            })
-            send_response(conn, 200, "application/json", data)
-
+    def _start_sequence(self):
+        if BACKUP_MS > 0:
+            self.state = "BACKUP"
+            self.timer_start = utime.ticks_ms()
+            self.pubsub.publish("car/cmd", {"dir": "bwd", "speed": BACKUP_SPEED})
+            print(f"[AUTO] Retrocediendo {BACKUP_MS} ms")
         else:
-            send_response(conn, 200, "text/html; charset=utf-8", HTML)
+            self.state = "ARM_DOWN"
+            self.timer_start = utime.ticks_ms()
+            self.pubsub.publish("arm/cmd", {"action": "abajo"})
+            print("[AUTO] Bajando brazo...")
 
-    except:
-        pass
-    finally:
-        conn.close()
+# ========== CONEXIÓN WiFi ==========
+def connect_wifi(ssid, password):
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(ssid, password)
+    for _ in range(150):
+        if wlan.isconnected():
+            ip = wlan.ifconfig()[0]
+            print(f"[WiFi] Conectado, IP: {ip}")
+            return True
+        utime.sleep_ms(100)
+    return False
 
-# ──────────────────────────────────────────────
-#  Main
-# ──────────────────────────────────────────────
-oled_msg("Robot11", "Iniciando...")
-time.sleep(1)
+# ========== MAIN ==========
+def main():
+    if not connect_wifi(WIFI_SSID, WIFI_PASS):
+        return
+    sched = Scheduler()
+    sock = SocketClient(BROKER_IP, BROKER_PORT, sched)
+    if not sock.connect():
+        print("[MAIN] Broker no conectado")
+        return
+    pubsub = Node(sock)
+    car = CarTask(sched, pubsub)
+    arm = ArmTask(sched, pubsub)
+    camera = CameraTask(sched, pubsub)
+    autonomy = AutonomyTask(sched, pubsub, car, arm, camera)
+    print("[MAIN] Robot listo. Colócalo frente a las cajas. Esperará detección de colores.")
+    sched.run()
 
-ip = conectar_wifi()
-
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", 80))
-srv.listen(3)
-srv.setblocking(False)
-
-print("Servidor web listo en http://{}".format(ip))
-oled_msg("Listo!", ip)
-
-ultimo_lectura = 0
-
-while True:
-    ahora = time.time()
-    if ahora - ultimo_lectura >= intervalo:
-        ultimo_v   = leer_voltaje()
-        ultimo_pct = calcular_pct(ultimo_v)
-        ultimo_cm  = leer_sonar()
-        dibujar(ultimo_v, ultimo_pct, ultimo_cm)
-        print("[BAT] {}V  {}%  |  [SONAR] {}cm".format(
-            ultimo_v, round(ultimo_pct, 1), ultimo_cm))
-        ultimo_lectura = ahora
-    try:
-        conn, _ = srv.accept()
-        manejar(conn)
-    except OSError:
-        pass
-    time.sleep_ms(20)
+if __name__ == "__main__":
+    main()
